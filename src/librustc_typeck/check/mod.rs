@@ -176,6 +176,10 @@ enum Expectation<'tcx> {
 
     /// This expression will be cast to the `Ty`
     ExpectCastableToType(Ty<'tcx>),
+
+    /// This rvalue expression will be wrapped in `&` or `Box` and coerced
+    /// to `&Ty` or `Box<Ty>`, respectively. `Ty` is `[A]` or `Trait`.
+    ExpectRvalueLikeUnsized(Ty<'tcx>),
 }
 
 impl<'tcx> Expectation<'tcx> {
@@ -196,7 +200,7 @@ impl<'tcx> Expectation<'tcx> {
     // when checking the 'then' block which are incompatible with the
     // 'else' branch.
     fn adjust_for_branches<'a>(&self, fcx: &FnCtxt<'a, 'tcx>) -> Expectation<'tcx> {
-        match self.only_has_type() {
+        match *self {
             ExpectHasType(ety) => {
                 let ety = fcx.infcx().shallow_resolve(ety);
                 if !ty::type_is_ty_var(ety) {
@@ -204,6 +208,9 @@ impl<'tcx> Expectation<'tcx> {
                 } else {
                     NoExpectation
                 }
+            }
+            ExpectRvalueLikeUnsized(ety) => {
+                ExpectRvalueLikeUnsized(ety)
             }
             _ => NoExpectation
         }
@@ -3678,7 +3685,7 @@ fn check_expr_with_unifier<'a, 'tcx, F>(fcx: &FnCtxt<'a, 'tcx>,
             match unop {
                 ast::UnUniq => match ty.sty {
                     ty::ty_uniq(ty) => {
-                        ExpectHasType(ty)
+                        Expectation::rvalue_hint(ty)
                     }
                     _ => {
                         NoExpectation
@@ -3767,7 +3774,13 @@ fn check_expr_with_unifier<'a, 'tcx, F>(fcx: &FnCtxt<'a, 'tcx>,
         let expected = expected.only_has_type();
         let hint = expected.map(fcx, |ty| {
             match ty.sty {
-                ty::ty_rptr(_, ref mt) | ty::ty_ptr(ref mt) => ExpectHasType(mt.ty),
+                ty::ty_rptr(_, ref mt) | ty::ty_ptr(ref mt) => {
+                    if ty::expr_is_lval(fcx.tcx(), &**oprnd) {
+                        ExpectHasType(mt.ty)
+                    } else {
+                        Expectation::rvalue_hint(mt.ty)
+                    }
+                }
                 _ => NoExpectation
             }
         });
@@ -3985,15 +3998,12 @@ fn check_expr_with_unifier<'a, 'tcx, F>(fcx: &FnCtxt<'a, 'tcx>,
         check_cast(fcx, expr, &**e, &**t);
       }
       ast::ExprVec(ref args) => {
-        let uty = match expected {
-            ExpectHasType(uty) => {
-                match uty.sty {
-                        ty::ty_vec(ty, _) => Some(ty),
-                        _ => None
-                }
+        let uty = expected.map_to_option(fcx, |uty| {
+            match uty.sty {
+                ty::ty_vec(ty, _) => Some(ty),
+                _ => None
             }
-            _ => None
-        };
+        });
 
         let typ = match uty {
             Some(uty) => {
@@ -4020,8 +4030,8 @@ fn check_expr_with_unifier<'a, 'tcx, F>(fcx: &FnCtxt<'a, 'tcx>,
         let uty = match expected {
             ExpectHasType(uty) => {
                 match uty.sty {
-                        ty::ty_vec(ty, _) => Some(ty),
-                        _ => None
+                    ty::ty_vec(ty, _) => Some(ty),
+                    _ => None
                 }
             }
             _ => None
@@ -4298,10 +4308,29 @@ fn constrain_path_type_parameters(fcx: &FnCtxt,
 }
 
 impl<'tcx> Expectation<'tcx> {
+    /// Provide an expectation for an rvalue expression given an *optional*
+    /// hint, which is not required for type safety (the resulting type might
+    /// be checked higher up, as is the case with `&expr` and `box expr`), but
+    /// is useful in determining the concrete type.
+    ///
+    /// The primary usecase is unpacking `&T` and `Box<T>`, where `T` is
+    /// unsized and propagating `ExpectHasType(T)` would try to assign `T` to
+    /// an rvalue expression, which is invalid. Instead, a weaker hint is used.
+    /// This is required, when e.g `T` is `[u8]` and the rvalue is `[1, 2, 3]`,
+    /// without the hint the integer literals would remain uninferred.
+    fn rvalue_hint(ty: Ty<'tcx>) -> Expectation<'tcx> {
+        match ty.sty {
+            ty::ty_vec(_, None) | ty::ty_trait(..) => {
+                ExpectRvalueLikeUnsized(ty)
+            }
+            _ => ExpectHasType(ty)
+        }
+    }
+
     fn only_has_type(self) -> Expectation<'tcx> {
         match self {
-            NoExpectation | ExpectCastableToType(..) => NoExpectation,
-            ExpectHasType(t) => ExpectHasType(t)
+            ExpectHasType(t) => ExpectHasType(t),
+            _ => NoExpectation
         }
     }
 
@@ -4321,6 +4350,10 @@ impl<'tcx> Expectation<'tcx> {
                 ExpectHasType(
                     fcx.infcx().resolve_type_vars_if_possible(&t))
             }
+            ExpectRvalueLikeUnsized(t) => {
+                ExpectRvalueLikeUnsized(
+                    fcx.infcx().resolve_type_vars_if_possible(&t))
+            }
         }
     }
 
@@ -4329,7 +4362,9 @@ impl<'tcx> Expectation<'tcx> {
     {
         match self.resolve(fcx) {
             NoExpectation => NoExpectation,
-            ExpectCastableToType(ty) | ExpectHasType(ty) => unpack(ty),
+            ExpectCastableToType(ty) |
+            ExpectHasType(ty) |
+            ExpectRvalueLikeUnsized(ty) => unpack(ty),
         }
     }
 
@@ -4338,7 +4373,9 @@ impl<'tcx> Expectation<'tcx> {
     {
         match self.resolve(fcx) {
             NoExpectation => None,
-            ExpectCastableToType(ty) | ExpectHasType(ty) => unpack(ty),
+            ExpectCastableToType(ty) |
+            ExpectHasType(ty) |
+            ExpectRvalueLikeUnsized(ty) => unpack(ty),
         }
     }
 }
@@ -4351,6 +4388,8 @@ impl<'tcx> Repr<'tcx> for Expectation<'tcx> {
                                         t.repr(tcx)),
             ExpectCastableToType(t) => format!("ExpectCastableToType({})",
                                                t.repr(tcx)),
+            ExpectRvalueLikeUnsized(t) => format!("ExpectRvalueLikeUnsized({})",
+                                                  t.repr(tcx)),
         }
     }
 }
